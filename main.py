@@ -2,15 +2,19 @@
 import secrets
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
+from threading import Lock
 from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 app = FastAPI(title="GETBACk Analyst Academy — Simulation Only")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 
 SCENARIOS = {
     "routine": {
@@ -88,6 +92,17 @@ CASES: dict[str, Case] = {}
 PROJECTS: dict[str, dict] = {}
 FINDINGS: dict[str, dict] = {}
 AUDIT: list[dict] = []
+LEDGER_LOCK = Lock()
+DEMO_ACCOUNTS = {
+    "DEMO-SOURCE-01": {"name": "Fictional customer A", "balance": 12000000, "device": "known", "usual": 400000, "limit": 10000000},
+    "DEMO-SOURCE-02": {"name": "Fictional customer B", "balance": 900000, "device": "new", "usual": 120000, "limit": 20000},
+    "DEMO-SOURCE-03": {"name": "Fictional business C", "balance": 6000000, "device": "known", "usual": 1500000, "limit": 5000000},
+    "DEMO-RECEIVER-01": {"name": "Known beneficiary", "balance": 100000, "flagged": False},
+    "DEMO-RECEIVER-02": {"name": "New beneficiary", "balance": 0, "flagged": False},
+    "DEMO-RECEIVER-03": {"name": "Training watchlist account", "balance": 0, "flagged": True},
+}
+TRANSFERS: dict[str, dict] = {}
+
 
 def record(event: str, ref: str):
     AUDIT.append({"time": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()), "event": event, "ref": ref})
@@ -99,7 +114,7 @@ def render(request: Request, name: str = "index.html", **context):
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
-    return render(request, recent=list(reversed(list(CASES.items())[-6:])), projects=PROJECTS, findings=FINDINGS, audit=list(reversed(AUDIT[-12:])))
+    return render(request, recent=list(reversed(list(CASES.items())[-8:])), projects=PROJECTS, findings=FINDINGS, audit=list(reversed(AUDIT[-15:])), completed=sum(c.decision is not None for c in CASES.values()), accounts=DEMO_ACCOUNTS, transfers=list(reversed(list(TRANSFERS.items())[-12:])), transfer_count=len(TRANSFERS))
 
 @app.post("/cases")
 def create_case(scenario_id: str = Form(...), project_id: str = Form(...)):
@@ -198,7 +213,78 @@ def finding_status(finding_id: str, status: str = Form(...)):
 
 @app.get("/report", response_class=HTMLResponse)
 def report(request: Request):
-    return render(request, name="report.html", projects=PROJECTS, findings=FINDINGS, cases=CASES, audit=AUDIT)
+    return render(request, name="report.html", projects=PROJECTS, findings=FINDINGS, cases=CASES, audit=AUDIT, transfers=TRANSFERS)
+
+
+@app.post("/transfers")
+def simulate_transfer(source_account: str = Form(...), drop_account: str = Form(...), amount: str = Form(...), expected_status: Literal["Credited", "Held", "Blocked", "Declined"] = Form(...)):
+    # Only synthetic accounts from this app can be selected or submitted.
+    if source_account not in {"DEMO-SOURCE-01", "DEMO-SOURCE-02", "DEMO-SOURCE-03"} or drop_account not in {"DEMO-RECEIVER-01", "DEMO-RECEIVER-02", "DEMO-RECEIVER-03"}:
+        raise HTTPException(400, "Only the built-in fictional accounts are accepted")
+    try:
+        value = Decimal(amount)
+    except InvalidOperation:
+        raise HTTPException(400, "Invalid amount")
+    if not value.is_finite() or value != value.quantize(Decimal("0.01")) or not (Decimal("0") < value <= Decimal("100000000")):
+        raise HTTPException(400, "Enter a positive amount of at most ₦100,000,000 with two decimal places")
+    with LEDGER_LOCK:
+        sender, receiver = DEMO_ACCOUNTS[source_account], DEMO_ACCOUNTS[drop_account]
+        signals = []
+        if receiver["flagged"]: signals.append("Beneficiary on synthetic watchlist")
+        if sender["device"] == "new": signals.append("Newly activated device")
+        if value > Decimal(str(sender["usual"] * 3)): signals.append("Amount far above usual activity")
+        if drop_account != "DEMO-RECEIVER-01": signals.append("Unfamiliar beneficiary")
+        if value > Decimal(str(sender["balance"])):
+            status, reason = "Declined", "Insufficient fictional balance"
+        elif value > Decimal(str(sender["limit"])):
+            status, reason = "Blocked", "Above this demo account's limit"
+        elif receiver["flagged"] or (sender["device"] == "new" and value > 10000) or (len(signals) >= 2 and value > 100000):
+            status, reason = "Held", "Risk signals require analyst review"
+        else:
+            sender["balance"] -= value
+            receiver["balance"] += value
+            status, reason = "Credited", "Controls passed; fictional ledger updated"
+        transfer_id = secrets.token_urlsafe(10)
+        TRANSFERS[transfer_id] = {"source": source_account, "destination": drop_account, "amount": value,
+            "status": status, "reason": reason, "signals": signals, "created": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+            "expected_status": expected_status, "test_result": "PASS" if status == expected_status else "FAIL",
+            "events": ["Instruction created in synthetic ledger", "Demo balance and limits checked", "Detection rules evaluated", "Disposition: " + status]}
+        record("Synthetic transfer " + status.lower(), transfer_id)
+    return RedirectResponse("/transfers/" + transfer_id, status_code=303)
+
+@app.get("/transfers/{transfer_id}", response_class=HTMLResponse)
+def transfer_detail(request: Request, transfer_id: str):
+    transaction = TRANSFERS.get(transfer_id)
+    if transaction is None:
+        raise HTTPException(404, "Demo transfer not found")
+    return render(request, name="transfer.html", transaction=transaction, transfer_id=transfer_id, accounts=DEMO_ACCOUNTS)
+
+@app.post("/transfers/{transfer_id}/review")
+def review_transfer(transfer_id: str, action: Literal["release", "decline"] = Form(...), rationale: str = Form(...)):
+    if not 15 <= len(rationale.strip()) <= 1000:
+        raise HTTPException(400, "Provide a rationale of 15 to 1000 characters")
+    with LEDGER_LOCK:
+        tx = TRANSFERS.get(transfer_id)
+        if tx is None:
+            raise HTTPException(404, "Demo transfer not found")
+        if tx["status"] != "Held":
+            raise HTTPException(409, "Only held demo transfers can be reviewed")
+        # Synthetic watchlist cases cannot be released by an analyst in this demo.
+        if action == "release" and DEMO_ACCOUNTS[tx["destination"]]["flagged"]:
+            raise HTTPException(403, "Demo watchlist control requires an independent review")
+        if action == "release":
+            sender = DEMO_ACCOUNTS[tx["source"]]
+            if sender["balance"] < tx["amount"]:
+                raise HTTPException(409, "Demo balance changed; cannot release")
+            sender["balance"] -= tx["amount"]
+            DEMO_ACCOUNTS[tx["destination"]]["balance"] += tx["amount"]
+            tx["status"] = "Credited after review"
+        else:
+            tx["status"] = "Declined after review"
+        tx["review_rationale"] = rationale.strip()
+        tx["events"].append("Analyst review: " + tx["status"])
+        record("Synthetic transfer reviewed", transfer_id)
+    return RedirectResponse("/transfers/" + transfer_id, status_code=303)
 
 @app.get("/health")
 def health():
